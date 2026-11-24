@@ -77,11 +77,11 @@ Interaction Sequence
 
 ### 3.2 Step 1: LightGCN Pre-training (Enriching Item Embeddings)
 
-Before training the Transformer, we pre-train item embeddings using **3-layer LightGCN** on the full user-item interaction graph with BPR loss for 50 epochs.
+Before training the Transformer, we pre-train item embeddings using **3-layer LightGCN** with BPR loss for 50 epochs. The graph contains **training interactions only**: each user's last two interactions (the validation and test targets) are removed before the graph is built, so the embeddings carry no information about the items we evaluate on.
 
 LightGCN performs neighbourhood aggregation — each item's embedding absorbs collaborative signals from the items its users also watched, and their neighbours, across 3 hops. This means even a cold-start item with few direct interactions gets a contextually rich embedding from the wider graph community.
 
-These embeddings are then frozen and used to initialise the Transformer's item embedding table. The GNN pre-training is done entirely offline.
+These embeddings initialise the Transformer's item embedding table and are fine-tuned with the rest of the model. The GNN pre-training is done entirely offline.
 
 ### 3.3 Step 2: Per-Interaction Feature Embeddings
 
@@ -171,6 +171,8 @@ Unexp(c, u) = Σ_k  w_k · ||normalize(emb_c) − center_k||₂
 where w_k is the fractional cluster size (larger clusters get more weight). All embeddings are L2-normalised before distance computation.
 
 This is computed **offline** during preprocessing for each user's history items, then stored and fed as `f_unexp` into the Transformer. At evaluation time, the same formula is applied to candidate items using the precomputed cluster centres.
+
+The clusters are fitted on each user's **training interactions only**. The validation and test items are scored against those clusters like any other candidate, so they never shape the centres. (Fitting on the full history would let the target item pull a centre towards itself, which both leaks the target into the `f_unexp` input feature and makes the target look less unexpected in AvgUnexp@K and Serendipity@K.)
 
 ### 4.3 Implementation Note
 
@@ -292,6 +294,8 @@ Serendipity@K = (1/K) × Σᵢ₌₁ᴷ ( Unexpectedness(i) × Relevance(i) )
 | Density | 5.07% |
 
 ### Final Test Results (Best Checkpoint — Epoch 25)
+
+> **Note:** these numbers come from the run *before* the data-leakage fix, when LightGCN, the unexpectedness clusters and item popularity were fitted on all interactions, including each user's val/test items. They will be replaced after the leak-free rerun.
 
 | Metric | @5 | @10 | @20 |
 |---|---|---|---|

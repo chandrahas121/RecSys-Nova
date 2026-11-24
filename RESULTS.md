@@ -43,6 +43,8 @@
 
 ## Final Test Results (Best Checkpoint — Epoch 45)
 
+> **Note:** the numbers in this file come from the run *before* the data-leakage fix, when LightGCN, the unexpectedness clusters and item popularity were fitted on all interactions, including each user's val/test items. They will be replaced after the leak-free rerun.
+
 ### Accuracy
 
 | Metric | @5 | @10 | @20 |
@@ -142,10 +144,10 @@ Per-user interest islands are found via MiniBatchKMeans (K = max(2, min(5, N//15
 Unexp(c, u) = Σ_k  w_k · ||norm(emb_c) − center_k||_2
 ```
 
-where centers and weights come from the user's interaction history.
+where centers and weights come from the user's training interactions only (the val/test items are scored against these clusters, never used to fit them).
 
 ### LightGCN Pre-training
-Item embeddings are enriched via 3-layer LightGCN (BPR, 50 epochs) on the full user-item interaction graph before being frozen and used as the item tower input.
+Item embeddings are enriched via 3-layer LightGCN (BPR, 50 epochs) on the training interactions only (each user's val/test items are removed from the graph). They initialise the item embedding table and are fine-tuned with the rest of the model.
 
 ### Why seq_len = 50? (Empirically Validated)
 

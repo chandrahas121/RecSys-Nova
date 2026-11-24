@@ -2,7 +2,9 @@
 PyTorch Dataset for the NOVA-style sequential recommender.
 
 Sequences are pre-computed in __init__ as contiguous numpy arrays.
-Negative sampling uses a fast rejection loop — correct for small num_negatives.
+Training negatives are re-drawn each epoch with a fast rejection loop.
+Val/test negatives are drawn once in __init__ (so every evaluation pass scores
+the same 100 candidates) and exclude every item the user interacted with.
 """
 
 import numpy as np
@@ -62,22 +64,56 @@ class SeqRecDataset(Dataset):
             self.arr_mask [i, pad:] = True
             self.target_iid[i]      = target[0] + 1
 
+        # ── Fixed evaluation candidates ───────────────────────────────────────
+        # Negatives must be items the user never interacted with in ANY split
+        # (not just the last max_seq_len items), and must not change between
+        # evaluation passes, or checkpoint selection on val becomes noisy.
+        self.eval_negs = None
+        if mode != 'train':
+            self.eval_negs = np.empty((n, num_negatives), dtype=np.int64)
+            for i, (uid, _, _) in enumerate(raw):
+                seen = {x[0] + 1 for part in ('train', 'val', 'test')
+                        for x in splits[uid][part]}
+                self.eval_negs[i] = self._sample_unseen(seen, num_negatives)
+
+    def _sample_unseen(self, seen: set, k: int) -> np.ndarray:
+        """k distinct 1-indexed item ids that are not in `seen`."""
+        if self.num_items - len(seen) < k:
+            # Catalogue too small for k distinct negatives (toy data in
+            # tests): fall back to sampling unseen items with replacement.
+            pool = np.setdiff1d(np.arange(1, self.num_items + 1),
+                                np.fromiter(seen, dtype=np.int64))
+            return self.rng.choice(pool, size=k, replace=True)
+        negs, picked = [], set()
+        while len(negs) < k:
+            for c in self.rng.integers(1, self.num_items + 1, size=k).tolist():
+                if c not in seen and c not in picked:
+                    picked.add(c)
+                    negs.append(c)
+                    if len(negs) == k:
+                        break
+        return np.asarray(negs, dtype=np.int64)
+
     def __len__(self):
         return len(self.uids)
 
     def __getitem__(self, idx):
         tgt_iid = int(self.target_iid[idx])
-        # Bulk tolist() is faster than a generator comprehension for set build
-        hist_iids = set(self.arr_iid[idx].tolist())
-        hist_iids.discard(0)     # remove PAD token
-        hist_iids.add(tgt_iid)
 
-        # Rejection sampling — ~4.06 iterations on average for num_neg=4
-        negs = []
-        while len(negs) < self.num_negatives:
-            n = int(self.rng.integers(1, self.num_items + 1))
-            if n not in hist_iids:
-                negs.append(n)
+        if self.eval_negs is not None:
+            negs = self.eval_negs[idx]
+        else:
+            # Bulk tolist() is faster than a generator comprehension for set build
+            hist_iids = set(self.arr_iid[idx].tolist())
+            hist_iids.discard(0)     # remove PAD token
+            hist_iids.add(tgt_iid)
+
+            # Rejection sampling — ~4.06 iterations on average for num_neg=4
+            negs = []
+            while len(negs) < self.num_negatives:
+                n = int(self.rng.integers(1, self.num_items + 1))
+                if n not in hist_iids:
+                    negs.append(n)
 
         # np.ascontiguousarray is a no-op for already-contiguous slices
         return {

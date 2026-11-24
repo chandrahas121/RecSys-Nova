@@ -9,6 +9,7 @@ Usage:
 import argparse
 import os
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -152,8 +153,11 @@ def main(cfg: Config):
 
     print('\n--- Training ---')
     for epoch in range(1, cfg.epochs + 1):
+        t0 = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, cfg.device)
         scheduler.step()
+        print(f'Epoch {epoch:3d}  loss={train_loss:.4f}  '
+              f'({time.time() - t0:.0f}s)', flush=True)
 
         if epoch % 5 == 0 or epoch == cfg.epochs:
             val_metrics = evaluate(model, val_loader, item_emb, item_pop,

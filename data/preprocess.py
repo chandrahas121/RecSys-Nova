@@ -15,6 +15,7 @@ Outputs (saved to processed_dir):
 
 import os
 import pickle
+import time
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -175,6 +176,7 @@ def pretrain_lightgcn(ratings: pd.DataFrame,
 
     print(f'[pretrain] Training LightGCN for {epochs} epochs '
           f'(batch={gnn_batch_size}, {n_pos:,} pairs) ...')
+    t_start = time.time()
 
     for epoch in range(1, epochs + 1):
         # ── Graph propagation: ONCE per epoch ───────────────────────────────
@@ -207,9 +209,10 @@ def pretrain_lightgcn(ratings: pd.DataFrame,
             total_loss += loss.item()
             n_batches  += 1
 
-        if epoch % max(1, epochs // 5) == 0 or epoch == epochs:
+        if epoch == 1 or epoch % max(1, epochs // 5) == 0 or epoch == epochs:
             print(f'  epoch {epoch:3d}/{epochs}  '
-                  f'BPR loss = {total_loss / n_batches:.4f}')
+                  f'BPR loss = {total_loss / n_batches:.4f}  '
+                  f'({time.time() - t_start:.0f}s elapsed)', flush=True)
 
     with torch.no_grad():
         _, item_emb = model()
@@ -220,39 +223,62 @@ def pretrain_lightgcn(ratings: pd.DataFrame,
 # 6. Per-user Mean Shift → offline unexpectedness scores
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_one_user(uid, seq, item_emb, bandwidth, min_samples):
-    """Worker for parallel unexpectedness computation (must be top-level for pickling)."""
-    from src.mean_shift import user_unexpectedness_and_clusters
-    if len(seq) == 0:
-        d = item_emb.shape[1]
-        return uid, np.array([], dtype=np.float32), \
+def _process_one_user(uid, train_iids, heldout_iids, item_emb, bandwidth,
+                      min_samples):
+    """
+    Worker for parallel unexpectedness computation (must be top-level for pickling).
+
+    Clusters are fitted on the user's TRAIN items only.  Held-out (val/test)
+    items are then scored against those clusters, exactly like an unseen
+    candidate, so they never influence the cluster centres.
+    """
+    from src.mean_shift import (user_unexpectedness_and_clusters,
+                                compute_candidate_unexpectedness)
+    d = item_emb.shape[1]
+    if len(train_iids) == 0:
+        return uid, np.zeros(len(heldout_iids), dtype=np.float32), \
                np.zeros((1, d), dtype=np.float32), np.ones(1, dtype=np.float32)
-    iids = np.array([s if isinstance(s, (int, np.integer)) else s[0]
-                     for s in seq], dtype=np.int64)
-    embs = item_emb[iids]
+
     scores, centers, weights = user_unexpectedness_and_clusters(
-        embs, bandwidth=bandwidth, min_samples=min_samples)
+        item_emb[train_iids], bandwidth=bandwidth, min_samples=min_samples)
+
+    if centers.any():
+        held = [compute_candidate_unexpectedness(item_emb[i], centers, weights)
+                for i in heldout_iids]
+    else:
+        # No clusters could be fitted (too few train items): the train items
+        # got 0, so the held-out items get 0 too.
+        held = [0.0] * len(heldout_iids)
+    scores = np.concatenate([scores, np.asarray(held, dtype=np.float32)])
     return uid, scores, centers, weights
 
 
-def compute_unexpectedness(user_sequences: dict,
+def compute_unexpectedness(train_seqs: dict,
+                           heldout_seqs: dict,
                            item_emb: np.ndarray,
                            bandwidth=None,
                            min_samples: int = 3):
     """
     Parallel per-user KMeans clustering -> unexpectedness scores + cluster info.
 
+    train_seqs   : uid -> chronological item ids the clusters may be fitted on
+    heldout_seqs : uid -> the user's val/test item ids (scored, never fitted)
+
     Returns
     -------
-    unexp_dict    : uid -> (T,) float32 per-interaction unexpectedness scores
-    cluster_dict  : uid -> {'centers': (K,d), 'weights': (K,)}
+    unexp_dict    : uid -> (T,) float32 per-interaction unexpectedness scores,
+                    in sequence order (train items, then held-out items)
+    cluster_dict  : uid -> {'centers': (K,d), 'weights': (K,)}  (train-only)
     """
     from joblib import Parallel, delayed
-    print('[unexp] Computing per-user unexpectedness (parallel KMeans) ...')
+    print('[unexp] Computing per-user unexpectedness (parallel KMeans, '
+          'fitted on train interactions only) ...')
 
-    items = list(user_sequences.items())
+    empty = np.array([], dtype=np.int64)
+    items = list(train_seqs.items())
     results = Parallel(n_jobs=-1, prefer='threads')(
-        delayed(_process_one_user)(uid, seq, item_emb, bandwidth, min_samples)
+        delayed(_process_one_user)(uid, seq, heldout_seqs.get(uid, empty),
+                                   item_emb, bandwidth, min_samples)
         for uid, seq in tqdm(items, desc='KMeans clusters')
     )
 
@@ -278,7 +304,9 @@ def build_sequences(ratings: pd.DataFrame,
     """
     sequences = {}
     for uid, group in ratings.groupby('uid'):
-        group = group.sort_values('timestamp')
+        # stable: keeps the tie order set by chronological_order(), so the
+        # last two items here are exactly the rows held out by holdout_mask()
+        group = group.sort_values('timestamp', kind='stable')
         iids      = group['iid'].values
         rts       = group['rating'].values.astype(np.float32)
         ts        = group['timestamp'].values
@@ -298,6 +326,29 @@ def build_sequences(ratings: pd.DataFrame,
 # 8. Train / val / test split  (leave-last-two-out)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def chronological_order(ratings: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reorder rows so each user's interactions are in sequence order.
+
+    Uses the same per-user sort the original pipeline used, so timestamp ties
+    resolve the same way and the val/test items stay the same ones.
+    """
+    order = np.concatenate([g.sort_values('timestamp').index.values
+                            for _, g in ratings.groupby('uid')])
+    return ratings.loc[order].reset_index(drop=True)
+
+
+def holdout_mask(ratings: pd.DataFrame) -> np.ndarray:
+    """
+    True for each user's last two interactions (val + test).  Must match
+    split_sequences(): users with fewer than 3 interactions are not split.
+    Expects rows in chronological_order().
+    """
+    from_end = ratings.groupby('uid').cumcount(ascending=False)  # 0 = last
+    n_user   = ratings.groupby('uid')['uid'].transform('size')
+    return ((from_end < 2) & (n_user >= 3)).values
+
+
 def split_sequences(sequences: dict) -> dict:
     splits = {}
     for uid, seq in sequences.items():
@@ -315,15 +366,26 @@ def split_sequences(sequences: dict) -> dict:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Written into done.flag.  Caches built before the leakage fix (LightGCN,
+# clusters and popularity fitted on val/test interactions too) have an empty
+# flag and are rebuilt automatically.
+CACHE_VERSION = 'train-only-v2'
+
+
 def run_preprocessing(cfg):
     import os, pickle
     os.makedirs(cfg.processed_dir, exist_ok=True)
 
-    # Check if already done
+    # Check if already done (and built by the current, leakage-free pipeline)
     done_flag = os.path.join(cfg.processed_dir, 'done.flag')
     if os.path.isfile(done_flag):
-        print('[preprocess] Processed data found – loading from cache.')
-        return _load_processed(cfg.processed_dir)
+        with open(done_flag) as f:
+            cached_version = f.read().strip()
+        if cached_version == CACHE_VERSION:
+            print('[preprocess] Processed data found – loading from cache.')
+            return _load_processed(cfg.processed_dir)
+        print('[preprocess] Cache was built by an older pipeline that fitted '
+              'on val/test data – rebuilding.')
 
     # 1. Download
     dataset = getattr(cfg, 'dataset', 'ml-1m')
@@ -351,9 +413,18 @@ def run_preprocessing(cfg):
     # 4. Genre matrix
     genre_mat, _ = build_genre_matrix(movies, item2idx)
 
-    # 5. Pre-train LightGCN
+    # 4b. Hold out each user's val + test interaction BEFORE fitting anything.
+    #     Everything learned below (LightGCN, clusters, popularity) sees only
+    #     train_ratings, so no val/test signal reaches the model or metrics.
+    ratings       = chronological_order(ratings)
+    is_heldout    = holdout_mask(ratings)
+    train_ratings = ratings[~is_heldout]
+    print(f'  held out {int(is_heldout.sum()):,} val/test interactions; '
+          f'fitting on the remaining {len(train_ratings):,}')
+
+    # 5. Pre-train LightGCN on the train graph only
     item_emb = pretrain_lightgcn(
-        ratings, num_users, num_items,
+        train_ratings, num_users, num_items,
         embed_dim=cfg.embed_dim,
         num_layers=cfg.gnn_layers,
         epochs=cfg.gnn_epochs,
@@ -362,22 +433,23 @@ def run_preprocessing(cfg):
         gnn_batch_size=getattr(cfg, 'gnn_batch_size', 4096),
     )
 
-    # 6. Build preliminary sequences (without unexp yet) for Mean Shift
-    prelim_seqs = {}
-    for uid, group in ratings.groupby('uid'):
-        group = group.sort_values('timestamp')
-        prelim_seqs[uid] = group['iid'].values.tolist()
+    # 6. Per-user item lists (row order is already chronological)
+    train_seqs   = {uid: g['iid'].values
+                    for uid, g in train_ratings.groupby('uid')}
+    heldout_seqs = {uid: g['iid'].values
+                    for uid, g in ratings[is_heldout].groupby('uid')}
 
-    # 7. Mean Shift unexpectedness + cluster info
+    # 7. Unexpectedness: clusters fitted on train items, val/test items scored
     unexp_dict, cluster_dict = compute_unexpectedness(
-        prelim_seqs,
+        train_seqs,
+        heldout_seqs,
         item_emb,
         bandwidth=cfg.ms_bandwidth,
         min_samples=cfg.ms_min_samples
     )
 
-    # 7b. Item popularity (interaction count normalised to [0,1])
-    item_pop = ratings['iid'].value_counts().reindex(
+    # 7b. Item popularity from train interactions (normalised to [0,1])
+    item_pop = train_ratings['iid'].value_counts().reindex(
         range(num_items), fill_value=0).values.astype(np.float32)
     item_pop = item_pop / item_pop.max() if item_pop.max() > 0 else item_pop
 
@@ -406,7 +478,8 @@ def run_preprocessing(cfg):
     np.save(os.path.join(cfg.processed_dir, 'genre_mat.npy'), genre_mat)
     np.save(os.path.join(cfg.processed_dir, 'item_pop.npy'), item_pop)
 
-    open(done_flag, 'w').close()
+    with open(done_flag, 'w') as f:
+        f.write(CACHE_VERSION)
     print('[preprocess] Done.')
 
     return {
