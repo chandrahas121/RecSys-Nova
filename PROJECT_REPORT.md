@@ -77,7 +77,7 @@ Interaction Sequence
 
 ### 3.2 Step 1: LightGCN Pre-training (Enriching Item Embeddings)
 
-Before training the Transformer, we pre-train item embeddings using **3-layer LightGCN** with BPR loss for 50 epochs. The graph contains **training interactions only**: each user's last two interactions (the validation and test targets) are removed before the graph is built, so the embeddings carry no information about the items we evaluate on.
+Before training the Transformer, we pre-train item embeddings using **3-layer LightGCN** with BPR loss for 100 epochs. The graph contains **training interactions only**: each user's last two interactions (the validation and test targets) are removed before the graph is built, so the embeddings carry no information about the items we evaluate on.
 
 LightGCN performs neighbourhood aggregation — each item's embedding absorbs collaborative signals from the items its users also watched, and their neighbours, across 3 hops. This means even a cold-start item with few direct interactions gets a contextually rich embedding from the wider graph community.
 
@@ -203,8 +203,8 @@ For each positive (target) item in a training sequence, we sample 4 random negat
 | eval_negatives | 99 | UIRS-GNN protocol: 99 neg + 1 target = 100 candidates |
 | lr | 1e-3 | AdamW with CosineAnnealingLR (η_min = 1e-4) |
 | dropout | 0.2 | Standard for this model size |
-| gnn_epochs | 50 | LightGCN pre-training |
-| training_epochs | 30 | Best checkpoint at epoch 25 by val NDCG@10 |
+| gnn_epochs | 100 | LightGCN pre-training (train interactions only) |
+| training_epochs | 50 | Best checkpoint at epoch 40 by val NDCG@10 |
 
 ### Training Speed Optimisations
 
@@ -229,6 +229,8 @@ For each positive (target) item in a training sequence, we sample 4 random negat
 
 The ML-1M history length distribution (median = 96, mean = 165) made seq_len=50 seem wrong — 70% of users are truncated. We retrained with seq_len=100 to test:
 
+> **Note:** this ablation was run with the pre-fix pipeline (see Section 8.1), so its absolute numbers are not comparable with the leak-free results in Section 8. Both arms share the same pipeline, so the comparison between them still holds; it has not been re-run leak-free.
+
 | Metric | seq_len=50 | seq_len=100 | Change |
 |---|---|---|---|
 | HR@10 | **0.7430** | 0.6467 | −9.6% |
@@ -249,7 +251,8 @@ seq_len=100 is worse on every metric. The reason is **recency bias** — the cor
 We follow the **UIRS-GNN leave-one-out protocol** exactly:
 
 - **Split**: For each user, the last interaction is test, the second-to-last is validation, the rest is training.
-- **Candidates**: At evaluation, each user has 1 target item + 99 randomly sampled negatives = 100 candidates total.
+- **Candidates**: At evaluation, each user has 1 target item + 99 randomly sampled negatives = 100 candidates total. Negatives are drawn once per dataset (so every validation pass scores the same candidates) and exclude every item the user interacted with in any split.
+- **No leakage**: LightGCN, the per-user clusters and item popularity are fitted only after each user's val/test items are held out.
 - **Metrics**: Computed from the rank of the target item among the 100 candidates.
 
 ### Metric Definitions
@@ -293,50 +296,66 @@ Serendipity@K = (1/K) × Σᵢ₌₁ᴷ ( Unexpectedness(i) × Relevance(i) )
 | Interactions | 998,539 |
 | Density | 5.07% |
 
-### Final Test Results (Best Checkpoint — Epoch 25)
-
-> **Note:** these numbers come from the run *before* the data-leakage fix, when LightGCN, the unexpectedness clusters and item popularity were fitted on all interactions, including each user's val/test items. They will be replaced after the leak-free rerun.
+### Final Test Results (Best Checkpoint — Epoch 40, Leak-Free)
 
 | Metric | @5 | @10 | @20 |
 |---|---|---|---|
-| HR | 0.6116 | **0.7430** | 0.8535 |
-| NDCG | 0.4653 | **0.5079** | 0.5360 |
-| Precision | 0.1223 | 0.0743 | 0.0427 |
-| **AUC** | **0.9098** (global) | | |
-| AvgUnexp | 0.7019 | 0.7402 | 0.7944 |
-| ILD | 0.3234 | 0.4023 | 0.5009 |
-| EPC | 0.7388 | 0.7667 | 0.8024 |
-| Coverage | 0.8169 | **0.9408** | 0.9939 |
+| HR | 0.6305 | **0.7530** | 0.8601 |
+| NDCG | 0.4883 | **0.5282** | 0.5554 |
+| Precision | 0.1261 | 0.0753 | 0.0430 |
+| **AUC** | **0.9155** (global) | | |
+| AvgUnexp | 0.7676 | 0.8037 | 0.8531 |
+| ILD | 0.4029 | 0.4812 | 0.5720 |
+| EPC | 0.7606 | 0.7868 | 0.8196 |
+| Coverage | 0.8558 | **0.9549** | 0.9963 |
+| Serendipity | 0.0913 | **0.0549** | 0.0318 |
 
 ### Lift Over Random Baseline
 
 | Metric | Random | NOVA | Lift |
 |---|---|---|---|
-| HR@10 | 0.097 | 0.743 | **7.9×** |
-| NDCG@10 | 0.043 | 0.508 | **11.8×** |
-| AUC | 0.500 | 0.910 | **+0.41 absolute** |
+| HR@10 | 0.097 | 0.753 | **7.8×** |
+| NDCG@10 | 0.043 | 0.528 | **12.3×** |
+| AUC | 0.500 | 0.9155 | **+0.42 absolute** |
 
 ### Comparison with UIRS-GNN Paper
 
 | Metric | UIRS-GNN (reported) | Our NOVA |
 |---|---|---|
-| HR@10 | ~0.70–0.76 | **0.743** |
-| NDCG@10 | ~0.45–0.53 | **0.508** |
-| AUC | ~0.87–0.92 | **0.910** |
-| EPC@10 | ~0.70–0.78 | **0.767** |
+| HR@10 | ~0.70–0.76 | **0.753** |
+| NDCG@10 | ~0.45–0.53 | **0.528** |
+| AUC | ~0.87–0.92 | **0.9155** |
+| EPC@10 | ~0.70–0.78 | **0.787** |
 
 Results are competitive with or exceed the UIRS-GNN baseline on all reported metrics.
 
 ### Overfitting Check (Val vs Test Gap)
 
-| Metric | Val | Test | Drop |
+| Metric | Val (ep 40) | Test | Drop |
 |---|---|---|---|
-| HR@10 | 0.7621 | 0.7430 | −2.5% |
-| NDCG@10 | 0.5269 | 0.5079 | −3.6% |
-| AUC | 0.9171 | 0.9098 | −0.8% |
-| Coverage@10 | 0.9426 | 0.9408 | −0.2% |
+| HR@10 | 0.7758 | 0.7530 | −2.9% |
+| NDCG@10 | 0.5501 | 0.5282 | −4.0% |
+| AUC | 0.9221 | 0.9155 | −0.7% |
+| Coverage@10 | 0.9620 | 0.9549 | −0.7% |
 
-All gaps < 5% — no overfitting.
+All gaps ≤ 4% — no overfitting.
+
+### 8.1 Effect of the Data-Leakage Fix
+
+An earlier version of the pipeline fitted LightGCN, the unexpectedness clusters and item popularity on *all* interactions, including each user's val/test items. It also drew evaluation negatives that only excluded the last 50 history items, so an item the user had watched earlier could be drawn as a "negative". The fix changed both. To separate them, the leak-free checkpoint was also scored with the old negative sampling (mean of 5 draws):
+
+| Test metric | Pre-fix run | Leak-free, old negatives | Leak-free, new negatives (reported) |
+|---|---|---|---|
+| HR@10 | 0.7480 | 0.7434 | 0.7530 |
+| NDCG@10 | 0.5144 | 0.5117 | 0.5282 |
+| AUC | 0.9114 | 0.9107 | 0.9155 |
+| AvgUnexp@10 | 0.7434 | 0.7835 | 0.8037 |
+| Serendipity@10 | 0.0504 | 0.0541 | 0.0549 |
+
+- Removing the leak changes accuracy by only about half a point (within single-seed noise). The higher reported accuracy comes from the tighter, fairer negatives.
+- Unexpectedness and serendipity rise under the *same* negatives: the target item no longer pulls a cluster centre towards itself, so it is no longer under-scored as "expected".
+
+See `RESULTS.md` for the full table and caveats.
 
 ---
 
@@ -350,7 +369,7 @@ All gaps < 5% — no overfitting.
 | `src/evaluate.py` | All 8 metric families, UIRS-GNN protocol |
 | `data/preprocess.py` | LightGCN pre-training, KMeans clustering (parallelised with joblib) |
 | `main.py` | Training entry point |
-| `checkpoints/nova_best.pt` | Best model weights (epoch 25) |
+| `checkpoints/nova_best.pt` | Best model weights (epoch 40, leak-free run) |
 | `data/processed/item_emb.npy` | LightGCN item embeddings (3260 × 64) |
 | `data/processed/user_clusters.pkl` | Per-user MiniBatchKMeans cluster centres and weights |
 | `RESULTS.md` | Full numerical results with validation curves |
